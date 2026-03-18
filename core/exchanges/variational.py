@@ -279,7 +279,24 @@ class VariationalExecutor:
             )
 
         # Шаг 2: отправляем ордер
-        result = await self._submit_market_order(quote_id, side, is_reduce_only=False)
+        # Если Variational вернёт 422 с tick-ошибкой (leg ratio) — исправляем qty и повторяем
+        try:
+            result = await self._submit_market_order(quote_id, side, is_reduce_only=False)
+        except RuntimeError as e:
+            corrected = self._fix_qty_from_error(str(e), qty)
+            if corrected is None or corrected <= 0:
+                raise
+            logger.info(
+                f"Variational: submit tick-fix {symbol}: qty {qty:.6f} → {corrected:.6f}"
+            )
+            qty = corrected
+            quote = await self._get_indicative_quote(symbol, qty)
+            quote_id = quote.get("quote_id") or ""
+            if not quote_id:
+                raise RuntimeError(
+                    f"Variational: quote_id не получен после tick-fix для {symbol}"
+                )
+            result = await self._submit_market_order(quote_id, side, is_reduce_only=False)
         order_id = (
             result.get("rfq_id")
             or result.get("order_id")
