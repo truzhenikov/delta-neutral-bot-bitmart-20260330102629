@@ -125,6 +125,7 @@ class VariationalExecutor:
         self._cf_clearance = cf_clearance  # оставлен для совместимости
         self._private_key = private_key   # приватный ключ для авто-обновления токена
         self._assets: dict = {}  # symbol → {funding_interval_s, ...}
+        self._qty_ticks: dict[str, float] = {}  # symbol → min_qty_tick (кеш из ошибок 422)
 
     def _headers(self) -> dict:
         return {
@@ -198,6 +199,24 @@ class VariationalExecutor:
                     return price
         raise ValueError(f"Variational: mark price для {symbol} не найдена")
 
+    def _format_qty(self, qty: float) -> str:
+        """Форматирует qty для API: целое число если qty целый, иначе до 8 знаков."""
+        if qty == int(qty):
+            return str(int(qty))
+        return f"{qty:.8f}".rstrip("0").rstrip(".")
+
+    def _snap_to_tick(self, symbol: str, qty: float) -> float:
+        """Округляет qty вниз к кешированному min_qty_tick. Если тик неизвестен — не трогает."""
+        tick = self._qty_ticks.get(symbol.upper())
+        if tick and tick > 0:
+            snapped = math.floor(qty / tick) * tick
+            if snapped != qty:
+                logger.info(
+                    f"Variational: pre-snap {symbol}: {qty:.6f} → {snapped:.6f} (tick={tick})"
+                )
+            return snapped
+        return qty
+
     async def _get_indicative_quote(self, symbol: str, qty: float) -> dict:
         """
         Шаг 1: запрашивает indicative quote.
@@ -210,7 +229,7 @@ class VariationalExecutor:
                 "settlement_asset": "USDC",
                 "underlying": symbol.upper(),
             },
-            "qty": f"{qty:.8f}",
+            "qty": self._format_qty(qty),
         }
         async with _make_chrome_session() as client:
             resp = await client.post(
@@ -301,136 +320,86 @@ class VariationalExecutor:
                 f"Variational: неожиданный ответ от orders/new/market: {resp.text[:200]}"
             )
 
-    def _snap_qty(self, qty: float, quote_response: dict) -> float:
-        """Округляет qty вниз до минимального тика инструмента из ответа quote."""
-        try:
-            tick = float(
-                (quote_response.get("qty_limits") or {}).get("min_qty_tick") or 0.1
-            )
-        except (TypeError, ValueError):
-            tick = 0.1
-        if tick <= 0:
-            tick = 0.1
+    def _parse_tick_from_error(self, error_text: str) -> float | None:
+        """Извлекает min_qty_tick / min-qty-tick из текста ошибки 422."""
+        m = re.search(r"min[-_]qty[-_]tick \(([0-9.]+)\)", error_text)
+        if m:
+            return float(m.group(1))
+        return None
+
+    def _fix_qty_for_tick(self, qty: float, tick: float) -> float:
+        """Округляет qty вниз к ближайшему кратному tick."""
         return math.floor(qty / tick) * tick
 
-    def _fix_qty_from_error(self, error_text: str, approx_qty: float) -> float | None:
+    async def _quote_and_submit(
+        self, symbol: str, qty: float, side: str, is_reduce_only: bool,
+    ) -> tuple[dict, float]:
         """
-        Парсит ошибку 422 и возвращает исправленный qty.
+        Запрашивает quote и отправляет ордер. Retry loop при 422 (tick-ошибка):
+        парсит min-qty-tick из ошибки, кеширует, округляет qty и повторяет.
+        Возвращает (result, final_qty).
+        """
+        MAX_RETRIES = 5
 
-        Variational возвращает два формата:
-          1) "qty × leg ratio (4152.7) must be a multiple of min-qty-tick (1)"
-             → snapped = floor(product / tick) * tick
-             → corrected_qty = snapped * approx_qty / product
-          2) "qty must be multiple of min-qty-tick (0.10)"
-             → corrected_qty = floor(approx_qty / tick) * tick
-        """
-        # Формат 1: leg ratio
-        m = re.search(
-            r"leg ratio \(([0-9.]+)\).*min-qty-tick \(([0-9.]+)\)", error_text
+        for attempt in range(MAX_RETRIES):
+            # Перед каждой попыткой: snap к кешированному тику
+            qty = self._snap_to_tick(symbol, qty)
+            if qty <= 0:
+                raise RuntimeError(f"Variational: qty=0 после округления для {symbol}")
+
+            quote = await self._get_indicative_quote(symbol, qty)
+            quote_id = quote.get("quote_id") or ""
+            if not quote_id:
+                raise RuntimeError(
+                    f"Variational: quote_id не получен для {symbol}, ответ: {quote}"
+                )
+
+            try:
+                result = await self._submit_market_order(quote_id, side, is_reduce_only)
+                return result, qty
+            except RuntimeError as e:
+                err = str(e)
+                tick = self._parse_tick_from_error(err)
+                if tick is None or tick <= 0:
+                    raise  # не tick-ошибка — пробрасываем
+                # Кешируем тик и пересчитываем qty
+                self._qty_ticks[symbol.upper()] = tick
+                new_qty = self._fix_qty_for_tick(qty, tick)
+                logger.info(
+                    f"Variational: tick-fix {symbol} (attempt {attempt+1}): "
+                    f"tick={tick}, qty {qty} → {new_qty}"
+                )
+                if new_qty <= 0 or new_qty == qty:
+                    raise  # не удалось исправить
+                qty = new_qty
+
+        raise RuntimeError(
+            f"Variational: не удалось подобрать qty для {symbol} за {MAX_RETRIES} попыток"
         )
-        if m:
-            product = float(m.group(1))   # qty * leg_ratio
-            tick = float(m.group(2))
-            if product > 0 and tick > 0 and approx_qty > 0:
-                snapped = math.floor(product / tick) * tick
-                corrected = snapped * approx_qty / product if snapped > 0 else None
-                logger.info(
-                    f"Variational tick-fix (leg ratio): product={product}, "
-                    f"tick={tick}, snapped={snapped}, corrected_qty={corrected}"
-                )
-                return corrected
-
-        # Формат 2: простой тик
-        m = re.search(r"min-qty-tick \(([0-9.]+)\)", error_text)
-        if m:
-            tick = float(m.group(1))
-            if tick > 0 and approx_qty > 0:
-                corrected = math.floor(approx_qty / tick) * tick
-                logger.info(
-                    f"Variational tick-fix (simple): tick={tick}, "
-                    f"approx_qty={approx_qty}, corrected_qty={corrected}"
-                )
-                return corrected if corrected > 0 else None
-
-        return None
 
     async def market_open(self, symbol: str, is_long: bool, size_usd: float) -> dict:
         """Открывает маркет-позицию через двухшаговую RFQ."""
         await self._ensure_assets()
 
-        # Получаем mark_price для расчёта примерного qty
         mark_price = await self._get_mark_price(symbol)
         if mark_price == 0:
             raise RuntimeError(f"Variational: нулевая цена для {symbol}")
 
-        approx_qty = size_usd / mark_price
+        qty = size_usd / mark_price
         side = "buy" if is_long else "sell"
 
-        # Шаг 1a: получаем quote с примерным qty, чтобы узнать min_qty_tick.
-        # Если Variational вернёт 422 с tick-ошибкой — парсим нужный тик из текста
-        # и повторяем с исправленным qty (нужно для токенов с tick=1, например STRK, LINEA).
-        try:
-            quote = await self._get_indicative_quote(symbol, approx_qty)
-            qty = self._snap_qty(approx_qty, quote)
-        except RuntimeError as e:
-            corrected = self._fix_qty_from_error(str(e), approx_qty)
-            if corrected is None or corrected <= 0:
-                raise
-            logger.info(
-                f"Variational: пересчитываем qty {symbol}: "
-                f"{approx_qty:.6f} → {corrected:.6f}"
-            )
-            quote = await self._get_indicative_quote(symbol, corrected)
-            qty = corrected
+        # Snap к кешированному тику (если уже известен)
+        qty = self._snap_to_tick(symbol, qty)
 
-        if qty <= 0:
-            raise RuntimeError(
-                f"Variational: qty после округления = 0 для {symbol} "
-                f"(size_usd={size_usd}, price={mark_price})"
-            )
-
-        # Шаг 1b: если qty изменился после округления — запрашиваем quote заново
-        if abs(qty - approx_qty) > 1e-9:
-            try:
-                quote = await self._get_indicative_quote(symbol, qty)
-            except RuntimeError as e:
-                corrected = self._fix_qty_from_error(str(e), qty)
-                if corrected is None or corrected <= 0:
-                    raise
-                qty = corrected
-                quote = await self._get_indicative_quote(symbol, qty)
-
-        mark_price = float(quote.get("mark_price") or mark_price)
         logger.info(
             f"Variational: {'лонг' if is_long else 'шорт'} {symbol}, "
             f"qty={qty}, price≈{mark_price}"
         )
 
-        quote_id = quote.get("quote_id") or ""
-        if not quote_id:
-            raise RuntimeError(
-                f"Variational: quote_id не получен для {symbol}, ответ: {quote}"
-            )
+        result, final_qty = await self._quote_and_submit(
+            symbol, qty, side, is_reduce_only=False,
+        )
 
-        # Шаг 2: отправляем ордер
-        # Если Variational вернёт 422 с tick-ошибкой (leg ratio) — исправляем qty и повторяем
-        try:
-            result = await self._submit_market_order(quote_id, side, is_reduce_only=False)
-        except RuntimeError as e:
-            corrected = self._fix_qty_from_error(str(e), qty)
-            if corrected is None or corrected <= 0:
-                raise
-            logger.info(
-                f"Variational: submit tick-fix {symbol}: qty {qty:.6f} → {corrected:.6f}"
-            )
-            qty = corrected
-            quote = await self._get_indicative_quote(symbol, qty)
-            quote_id = quote.get("quote_id") or ""
-            if not quote_id:
-                raise RuntimeError(
-                    f"Variational: quote_id не получен после tick-fix для {symbol}"
-                )
-            result = await self._submit_market_order(quote_id, side, is_reduce_only=False)
         order_id = (
             result.get("rfq_id")
             or result.get("order_id")
@@ -441,7 +410,7 @@ class VariationalExecutor:
         logger.info(f"Variational: ордер принят {symbol}, id={order_id}")
         return {
             "order_id": order_id,
-            "size": qty,
+            "size": final_qty,
             "size_usd": size_usd,
             "price": mark_price,
         }
@@ -457,18 +426,11 @@ class VariationalExecutor:
             f"Variational: закрытие {symbol}, size={original_size:.6f}, side={close_side}"
         )
 
-        # Шаг 1: получаем quote_id
-        quote = await self._get_indicative_quote(symbol, original_size)
-        quote_id = quote.get("quote_id") or ""
-        if not quote_id:
-            raise RuntimeError(
-                f"Variational: quote_id не получен для закрытия {symbol}, ответ: {quote}"
-            )
-        mark_price = float(quote.get("mark_price") or mark_price)
-
-        # Шаг 2: отправляем reduce_only ордер
         try:
-            await self._submit_market_order(quote_id, close_side, is_reduce_only=True)
+            result, _ = await self._quote_and_submit(
+                symbol, original_size, close_side, is_reduce_only=True,
+            )
+            mark_price = float(result.get("mark_price", mark_price))
             logger.info(f"Variational: позиция {symbol} закрыта")
             return {"symbol": symbol, "price": mark_price}
         except RuntimeError as e:
