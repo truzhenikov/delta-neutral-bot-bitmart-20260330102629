@@ -21,9 +21,9 @@ class BitMartExecutor:
         self.api_memo = api_memo
         self._markets: dict[str, dict] = {}
 
-    def _headers(self, body: dict | None = None) -> dict:
+    def _headers_from_body_str(self, body_str: str) -> dict:
+        """BitMart signature must match the exact raw JSON body bytes."""
         timestamp = str(int(time.time() * 1000))
-        body_str = json.dumps(body or {}, separators=(",", ":"))
         sign_payload = f"{timestamp}#{self.api_memo}#{body_str}"
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
@@ -36,6 +36,10 @@ class BitMartExecutor:
             "X-BM-SIGN": signature,
             "X-BM-TIMESTAMP": timestamp,
         }
+
+    def _headers(self, body: dict | None = None) -> dict:
+        body_str = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False)
+        return self._headers_from_body_str(body_str)
 
     async def _keyed_get(self, path: str, params: dict | None = None) -> dict:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -50,11 +54,15 @@ class BitMartExecutor:
         return data
 
     async def _signed_post(self, path: str, body: dict) -> dict:
+        # Важно: подписываем и отправляем один и тот же сериализованный JSON,
+        # иначе BitMart может вернуть "Header X-BM-SIGN is wrong".
+        body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        headers = self._headers_from_body_str(body_str)
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{self.BASE_URL}{path}",
-                json=body,
-                headers=self._headers(body),
+                content=body_str,
+                headers=headers,
             )
         data = resp.json()
         if resp.status_code != 200 or data.get("code") != 1000:
