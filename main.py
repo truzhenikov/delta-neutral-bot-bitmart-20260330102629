@@ -16,9 +16,9 @@ from config import (
 )
 from scanners.hyperliquid import HyperliquidScanner
 from scanners.bybit import BybitScanner
+from scanners.bitmart import BitMartScanner
 from scanners.backpack import BackpackScanner
 from scanners.extended import ExtendedScanner
-from scanners.lighter import LighterScanner
 from scanners.variational import VariationalScanner
 from core.analyzer import find_best_opportunities
 from core.executor import (
@@ -53,10 +53,12 @@ LIQ_ALERT_COOLDOWN_SECONDS = 1800
 
 # Фандинг в минусе: запоминаем время начала (для таймера ожидания)
 _negative_funding_since: dict[str, float] = {}
+# Ошибки factual funding API: не спамить одно и то же слишком часто
+_funding_data_alerts_sent: dict[str, float] = {}
 
 # Размеры позиций по типу пары
 _position_sizes: dict = {
-    "LT_BP": POSITION_SIZE_USD,   # Lighter × Backpack
+    "LT_BP": POSITION_SIZE_USD,   # BitMart × Backpack
     "VR_EXT": POSITION_SIZE_USD,  # Variational × Extended
 }
 
@@ -217,9 +219,9 @@ async def _check_variational_token():
 ALL_SCANNERS = [
     HyperliquidScanner(),
     BybitScanner(),
+    BitMartScanner(),
     BackpackScanner(),
     ExtendedScanner(),
-    LighterScanner(),
     VariationalScanner(),
 ]
 
@@ -291,22 +293,23 @@ async def _verify_positions():
     except Exception as e:
         logger.warning(f"Верификация: Backpack positions недоступны: {e}")
 
-    # ── Lighter: получаем реальные позиции ─────────────────────────────────────
+    # ── BitMart: получаем реальные позиции ─────────────────────────────────────
     lt_map: dict | None = None
     try:
-        from core.executor import _get_lighter
-        lighter = _get_lighter()
-        lt_real = await lighter.get_positions()
-        await lighter.close()
+        from core.executor import _get_bitmart
+        bitmart = _get_bitmart()
+        lt_real = await bitmart.get_positions()
         if lt_real is not None:
             lt_map = {}
             for pos in lt_real:
-                sym = pos.get("symbol", "").upper()
-                qty = float(pos.get("quantity", 0))
+                sym = pos.get("symbol", "").replace("USDT", "").upper()
+                qty = float(pos.get("current_amount") or 0)
+                if int(pos.get("position_type") or 0) == 2:
+                    qty = -qty
                 if qty != 0:
                     lt_map[sym] = qty
     except Exception as e:
-        logger.warning(f"Верификация: Lighter positions недоступны: {e}")
+        logger.warning(f"Верификация: BitMart positions недоступны: {e}")
 
     # ── Сверяем с БД ───────────────────────────────────────────────────────────
     alerts = []
@@ -316,7 +319,7 @@ async def _verify_positions():
             continue
         symbol = legs[0]["symbol"]
         bp_leg = next((l for l in legs if l["exchange"] == "Backpack"), None)
-        lt_leg = next((l for l in legs if l["exchange"] == "Lighter"), None)
+        lt_leg = next((l for l in legs if l["exchange"] == "BitMart"), None)
 
         # Проверяем Backpack
         if bp_map is not None and bp_leg:
@@ -328,15 +331,15 @@ async def _verify_positions():
                 real_dir = "LONG" if bp_qty > 0 else "SHORT"
                 alerts.append(f"*{symbol}* Backpack: направление не совпадает (БД: {bp_leg['direction']}, биржа: {real_dir})")
 
-        # Проверяем Lighter
+        # Проверяем BitMart
         if lt_map is not None and lt_leg:
             lt_qty = lt_map.get(symbol, 0)
             expected_long = (lt_leg["direction"] == "LONG")
             if lt_qty == 0:
-                alerts.append(f"*{symbol}* Lighter: позиция исчезла (в БД: {lt_leg['direction']})")
+                alerts.append(f"*{symbol}* BitMart: позиция исчезла (в БД: {lt_leg['direction']})")
             elif (lt_qty > 0) != expected_long:
                 real_dir = "LONG" if lt_qty > 0 else "SHORT"
-                alerts.append(f"*{symbol}* Lighter: направление не совпадает (БД: {lt_leg['direction']}, биржа: {real_dir})")
+                alerts.append(f"*{symbol}* BitMart: направление не совпадает (БД: {lt_leg['direction']}, биржа: {real_dir})")
 
     if not alerts:
         return
@@ -356,7 +359,7 @@ async def _verify_positions():
 
 
 async def scan_and_notify():
-    """Сканируем все биржи, сохраняем историю, ищем пары Lighter × Backpack."""
+    """Сканируем все биржи, сохраняем историю, ищем пары BitMart × Backpack."""
     logger.info("Запуск сканирования всех бирж...")
 
     exchange_rates = await fetch_all_rates()
@@ -374,7 +377,7 @@ async def scan_and_notify():
         if open_positions:
             rates_map = {r.symbol: r for r in hl_rates}
             for pos in open_positions:
-                # Только HL-позиции; Lighter/Backpack мониторит _monitor_open_pairs
+                # Только HL-позиции; BitMart/Backpack мониторит _monitor_open_pairs
                 if pos.get("exchange") != "Hyperliquid":
                     continue
                 current = rates_map.get(pos["symbol"])
@@ -389,15 +392,15 @@ async def scan_and_notify():
                             f"Нажми кнопку *{BTN_POSITIONS}* чтобы закрыть."
                         )
 
-    # Ищем кросс-биржевые пары Lighter + Backpack (работает независимо от HL)
-    lighter_rates = exchange_rates.get("Lighter", [])
+    # Ищем кросс-биржевые пары BitMart + Backpack (работает независимо от HL)
+    lighter_rates = exchange_rates.get("BitMart", [])
     backpack_rates = exchange_rates.get("Backpack", [])
     if lighter_rates and backpack_rates:
         await _verify_positions()
         await _monitor_open_pairs(lighter_rates, backpack_rates)
         await _scan_pair_opportunities(lighter_rates, backpack_rates)
     else:
-        logger.warning(f"Lighter или Backpack не ответили — пропускаем скан пар")
+        logger.warning("BitMart или Backpack не ответили — пропускаем скан пар")
 
     # Ищем кросс-биржевые пары Variational + Extended
     vr_rates = exchange_rates.get("Variational", [])
@@ -421,6 +424,7 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
 
     # Получаем реальные позиции Backpack для проверки ликвидации
     bp_positions_real: dict = {}
+    bitmart_funding_real: dict[str, float] = {}
     try:
         from core.executor import _get_backpack
         backpack = _get_backpack()
@@ -430,6 +434,22 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
             bp_positions_real[sym] = pos
     except Exception as e:
         logger.warning(f"_monitor_open_pairs: Backpack positions недоступны: {e}")
+
+    try:
+        from core.executor import _get_bitmart
+        bitmart = _get_bitmart()
+        open_symbols = {
+            p["legs"][0]["symbol"]
+            for p in pairs
+            if len(p.get("legs", [])) == 2 and {l["exchange"] for l in p["legs"]} == {"BitMart", "Backpack"}
+        }
+        for sym in open_symbols:
+            try:
+                bitmart_funding_real[sym] = await bitmart.get_cumulative_funding_payment(sym)
+            except Exception as e:
+                logger.warning(f"_monitor_open_pairs: BitMart funding недоступен для {sym}: {e}")
+    except Exception as e:
+        logger.warning(f"_monitor_open_pairs: BitMart funding API недоступен: {e}")
 
     for pair in pairs:
         legs = pair["legs"]
@@ -444,7 +464,7 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
         if not lt_rate or not bp_rate:
             continue
 
-        lt_leg = next((l for l in legs if l["exchange"] == "Lighter"), None)
+        lt_leg = next((l for l in legs if l["exchange"] == "BitMart"), None)
         bp_leg = next((l for l in legs if l["exchange"] == "Backpack"), None)
         if not lt_leg or not bp_leg:
             continue
@@ -457,6 +477,44 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
         bp_income = bp_rate.apr if bp_dir == "SHORT" else -bp_rate.apr
         net_apr = lt_income + bp_income
 
+        # ── Проверка накопленного фандинга (только фактические данные) ───────────
+        bp_pos_data = bp_positions_real.get(symbol)
+        bp_funding = None
+        if bp_pos_data is not None:
+            raw = bp_pos_data.get("cumulativeFundingPayment") or bp_pos_data.get("fundingPayment")
+            if raw is not None:
+                bp_funding = float(raw)
+
+        lt_funding = bitmart_funding_real.get(symbol)
+        total_funding_usd = None if (bp_funding is None or lt_funding is None) else (bp_funding + lt_funding)
+        net_funding_pct = _net_funding_pct(total_funding_usd, legs)
+
+        if net_funding_pct is not None and net_funding_pct >= FUNDING_TAKE_PROFIT_PCT:
+            logger.info(
+                f"Автозакрытие {symbol}: накопленный funding {net_funding_pct:.3f}% >= {FUNDING_TAKE_PROFIT_PCT:.2f}%"
+            )
+            _negative_funding_since.pop(pair_id, None)
+            await _auto_close_pair(
+                pair_id, symbol, legs,
+                reason=(
+                    f"накопленный чистый funding достиг `{net_funding_pct:.3f}%` "
+                    f"(порог `{FUNDING_TAKE_PROFIT_PCT:.2f}%`)\n"
+                    f"Примерно: `${total_funding_usd:.4f}`"
+                ),
+            )
+            continue
+
+        if bp_funding is None or lt_funding is None:
+            alert_key = f"funding_data_missing:{pair_id}"
+            last_sent = _funding_data_alerts_sent.get(alert_key, 0)
+            if time.time() - last_sent >= LIQ_ALERT_COOLDOWN_SECONDS:
+                _funding_data_alerts_sent[alert_key] = time.time()
+                logger.info(
+                    f"{symbol}: factual funding threshold пропущен — "
+                    f"Backpack={'ok' if bp_funding is not None else 'нет'}; "
+                    f"BitMart={'ok' if lt_funding is not None else 'нет'}"
+                )
+
         # ── Проверка фандинга ─────────────────────────────────────────────────────
         if net_apr < NEG_APR_HARD_CLOSE:
             # Сильный минус — закрываем немедленно без ожидания
@@ -465,7 +523,7 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
             await _auto_close_pair(
                 pair_id, symbol, legs,
                 reason=f"нетто APR упал до `{net_apr:.1f}%` (порог {NEG_APR_HARD_CLOSE}%)\n"
-                       f"Lighter `{lt_rate.apr:+.1f}%` | Backpack `{bp_rate.apr:+.1f}%`",
+                       f"BitMart `{lt_rate.apr:+.1f}%` | Backpack `{bp_rate.apr:+.1f}%`",
             )
             continue
 
@@ -483,7 +541,7 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
                     wait_h = int(NEG_APR_WAIT_HOURS)
                     await send_message(
                         f"⚠️ *Фандинг ушёл в минус — {symbol}*\n\n"
-                        f"Lighter `{lt_rate.apr:+.1f}%` | Backpack `{bp_rate.apr:+.1f}%`\n"
+                        f"BitMart `{lt_rate.apr:+.1f}%` | Backpack `{bp_rate.apr:+.1f}%`\n"
                         f"Нетто: `{net_apr:+.1f}%` APR\n\n"
                         f"Жду `{wait_h}ч` — если не восстановится, закрою автоматически.",
                         reply_markup=keyboard,
@@ -503,7 +561,6 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
             _negative_funding_since.pop(pair_id, None)
 
         # ── Проверка ликвидации: Backpack (реальная liquidationPrice) ─────────────
-        bp_pos_data = bp_positions_real.get(symbol)
         if bp_pos_data:
             try:
                 liq_price = float(bp_pos_data.get("liquidationPrice") or 0)
@@ -544,7 +601,7 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
             except (ValueError, TypeError) as e:
                 logger.debug(f"Ошибка ликвидационной цены {symbol}: {e}")
 
-        # ── Проверка ликвидации: Lighter (отклонение от входа) ───────────────────
+        # ── Проверка ликвидации: BitMart (отклонение от входа) ───────────────────
         lt_entry = lt_leg.get("entry_price", 0) if lt_leg else 0
         current_price = bp_rate.mark_price if bp_rate else 0
 
@@ -558,10 +615,10 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
 
             if lt_loss_pct >= LT_AUTO_CLOSE_PCT:
                 # Сильное отклонение — автозакрытие
-                logger.warning(f"Автозакрытие {symbol}: Lighter цена {direction_str} на {lt_loss_pct:.1f}%")
+                logger.warning(f"Автозакрытие {symbol}: BitMart цена {direction_str} на {lt_loss_pct:.1f}%")
                 await _auto_close_pair(
                     pair_id, symbol, legs,
-                    reason=f"Lighter ({lt_dir}): цена {direction_str} на `{lt_loss_pct:.1f}%` от входа (порог {LT_AUTO_CLOSE_PCT}%)\n"
+                    reason=f"BitMart ({lt_dir}): цена {direction_str} на `{lt_loss_pct:.1f}%` от входа (порог {LT_AUTO_CLOSE_PCT}%)\n"
                            f"Вход: `${lt_entry:.4f}` → Сейчас: `${current_price:.4f}`",
                 )
                 continue
@@ -578,9 +635,9 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
                     ]])
                     await send_message(
                         f"⚠️ *РИСК ЛИКВИДАЦИИ — {symbol}*\n\n"
-                        f"Lighter ({lt_dir}): цена {direction_str} на `{lt_loss_pct:.1f}%` от входа\n"
+                        f"BitMart ({lt_dir}): цена {direction_str} на `{lt_loss_pct:.1f}%` от входа\n"
                         f"  Вход: `${lt_entry:.4f}` → Сейчас: `${current_price:.4f}`\n\n"
-                        f"⚠️ _Точная цена ликвидации Lighter API не даёт._\n"
+                        f"⚠️ _Точную цену ликвидации BitMart тут не используем, следим по отклонению от входа._\n"
                         f"Закрою автоматически при `{LT_AUTO_CLOSE_PCT}%`",
                         reply_markup=keyboard,
                     )
@@ -591,11 +648,30 @@ MIN_VOLUME_USD = 50_000   # минимальный дневной объём н�
 
 LIQ_WARN_PCT = 20.0        # % расстояния до ликвидации (Backpack) → предупреждение
 LIQ_AUTO_CLOSE_PCT = 15.0  # % расстояния до ликвидации (Backpack) → АВТОЗАКРЫТИЕ
-LT_WARN_MOVE_PCT = 10.0    # % отклонения цены против Lighter ноги → предупреждение
-LT_AUTO_CLOSE_PCT = 15.0   # % отклонения цены против Lighter ноги → АВТОЗАКРЫТИЕ
+LT_WARN_MOVE_PCT = 10.0    # % отклонения цены против BitMart ноги → предупреждение
+LT_AUTO_CLOSE_PCT = 15.0   # % отклонения цены против BitMart ноги → АВТОЗАКРЫТИЕ
+FUNDING_TAKE_PROFIT_PCT = 0.15  # накопленный чистый funding % → АВТОЗАКРЫТИЕ
 
 NEG_APR_HARD_CLOSE = -50.0  # APR пары ниже этого → АВТОЗАКРЫТИЕ немедленно
 NEG_APR_WAIT_HOURS = 4.0    # часов ожидания при мягком минусе перед автозакрытием
+
+
+def _net_funding_pct(total_funding_usd: float | None, legs: list[dict]) -> float | None:
+    """Переводит накопленный funding в обычный % от размера одной ноги."""
+    if total_funding_usd is None or not legs:
+        return None
+    base_usd = min(float(l.get("position_size_usd") or 0) for l in legs)
+    if base_usd <= 0:
+        return None
+    return (total_funding_usd / base_usd) * 100
+
+
+def _estimated_leg_funding_usd(leg: dict | None, rate_obj, opened_ago_h: float) -> float | None:
+    """Оценка накопленного funding в USD по текущей ставке."""
+    if not leg or not rate_obj:
+        return None
+    sign = 1 if leg["direction"] == "SHORT" else -1
+    return sign * rate_obj.rate * opened_ago_h * leg["position_size_usd"]
 
 
 async def _auto_close_pair(pair_id: str, symbol: str, legs: list, reason: str):
@@ -621,7 +697,7 @@ async def _auto_close_pair(pair_id: str, symbol: str, legs: list, reason: str):
 
 
 async def _scan_pair_opportunities(lighter_rates: list, backpack_rates: list):
-    """Ищет возможности Lighter + Backpack и отправляет уведомления."""
+    """Ищет возможности BitMart + Backpack и отправляет уведомления."""
     if not _signals_enabled["LT_BP"]:
         return
     lt_map = {r.symbol: r for r in lighter_rates}
@@ -665,7 +741,7 @@ async def _scan_pair_opportunities(lighter_rates: list, backpack_rates: list):
         return
 
     opps.sort(key=lambda x: x["net_apr"], reverse=True)
-    logger.info(f"Lighter×Backpack: найдено {len(opps)} возможностей")
+    logger.info(f"BitMart×Backpack: найдено {len(opps)} возможностей")
 
     for opp in opps[:3]:
         signal_key = f"LT_BP:{opp['symbol']}:{opp['lt_dir']}:{opp['bp_dir']}"
@@ -676,16 +752,16 @@ async def _scan_pair_opportunities(lighter_rates: list, backpack_rates: list):
         bp_label = "шорт ↓" if opp["bp_dir"] == "SHORT" else "лонг ↑"
 
         text = (
-            f"🔀 *{opp['symbol']}* — Lighter × Backpack\n\n"
-            f"  Lighter ({lt_label}): `{opp['lt_apr']:+.1f}%`\n"
+            f"🔀 *{opp['symbol']}* — BitMart × Backpack\n\n"
+            f"  BitMart ({lt_label}): `{opp['lt_apr']:+.1f}%`\n"
             f"  Backpack ({bp_label}): `{opp['bp_apr']:+.1f}%`\n"
             f"  📈 Нетто: `~{opp['net_apr']:.1f}% APR`\n\n"
-            f"  💸 Lighter: 0% комиссия | Backpack: 0.04%"
+            f"  💸 BitMart: 0.06% | Backpack: 0.04%"
         )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "✅ Открыть пару",
-                callback_data=f"open_pair:Lighter:Backpack:{opp['symbol']}:{opp['lt_dir']}:{opp['bp_dir']}"
+                callback_data=f"open_pair:BitMart:Backpack:{opp['symbol']}:{opp['lt_dir']}:{opp['bp_dir']}"
             ),
             InlineKeyboardButton("❌ Пропустить", callback_data="skip"),
         ]])
@@ -713,6 +789,8 @@ async def _monitor_open_pairs_vr_ext(vr_rates: list, ext_rates: list):
         vr_leg = next(l for l in legs if l["exchange"] == "Variational")
         ext_leg = next(l for l in legs if l["exchange"] == "Extended")
         symbol = vr_leg["symbol"]
+        opened_at = min(l["opened_at"] for l in legs)
+        opened_ago_h = (time.time() - opened_at) / 3600
 
         vr_rate = vr_map.get(symbol)
         ext_rate = ext_map.get(symbol)
@@ -739,13 +817,11 @@ async def _monitor_open_pairs_vr_ext(vr_rates: list, ext_rates: list):
         elif net_apr < 0:
             if pair_id not in _negative_funding_since:
                 _negative_funding_since[pair_id] = time.time()
-                opened_at = min(l["opened_at"] for l in legs)
-                hours = (time.time() - opened_at) / 3600
                 await send_message(
                     f"⚠️ *Фандинг стал отрицательным — {symbol}* (VR+EXT)\n\n"
                     f"Нетто APR: `{net_apr:+.1f}%`\n"
                     f"Variational `{vr_rate.apr:+.1f}%` | Extended `{ext_rate.apr:+.1f}%`\n"
-                    f"Открыта `{hours:.1f}ч` назад\n\n"
+                    f"Открыта `{opened_ago_h:.1f}ч` назад\n\n"
                     f"_Жду {int(NEG_APR_WAIT_HOURS)}ч — если не восстановится, закрою автоматически._",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("❌ Закрыть пару", callback_data=f"close_pair:{pair_id}:{symbol}"),
@@ -929,7 +1005,7 @@ async def show_settings(update: Update):
         [InlineKeyboardButton("── Биржи ──", callback_data="noop")],
         [
             InlineKeyboardButton(
-                f"{'✅' if lt_bp_on else '❌'} Lighter × Backpack",
+                f"{'✅' if lt_bp_on else '❌'} BitMart × Backpack",
                 callback_data="toggle_signals:LT_BP"
             ),
             InlineKeyboardButton(
@@ -938,7 +1014,7 @@ async def show_settings(update: Update):
             ),
         ],
         [InlineKeyboardButton("── Размер позиций ──", callback_data="noop")],
-        [InlineKeyboardButton(f"── Lighter × Backpack (${lt_bp:.0f}) ──", callback_data="noop")],
+        [InlineKeyboardButton(f"── BitMart × Backpack (${lt_bp:.0f}) ──", callback_data="noop")],
         [
             InlineKeyboardButton("$15",   callback_data="setsize:LT_BP:15"),
             InlineKeyboardButton("$50",   callback_data="setsize:LT_BP:50"),
@@ -946,7 +1022,7 @@ async def show_settings(update: Update):
             InlineKeyboardButton("$250",  callback_data="setsize:LT_BP:250"),
             InlineKeyboardButton("$500",  callback_data="setsize:LT_BP:500"),
         ],
-        [InlineKeyboardButton("✏️ Ввести вручную (LT+BP)", callback_data="setsize:LT_BP:manual")],
+        [InlineKeyboardButton("✏️ Ввести вручную (BM+BP)", callback_data="setsize:LT_BP:manual")],
         [InlineKeyboardButton(f"── Variational × Extended (${vr_ext:.0f}) ──", callback_data="noop")],
         [
             InlineKeyboardButton("$15",   callback_data="setsize:VR_EXT:15"),
@@ -959,7 +1035,7 @@ async def show_settings(update: Update):
     ])
     await update.message.reply_text(
         f"⚙️ *Настройки*\n\n"
-        f"Lighter × Backpack: `${lt_bp:.0f}` на каждую ногу\n"
+        f"BitMart × Backpack: `${lt_bp:.0f}` на каждую ногу\n"
         f"Variational × Extended: `${vr_ext:.0f}` на каждую ногу\n\n"
         f"Выбери размер или включи/выключи сигналы:",
         parse_mode=ParseMode.MARKDOWN,
@@ -978,7 +1054,7 @@ async def show_positions(update: Update):
     # Запрашиваем все данные параллельно — ставки + реальные позиции Backpack
     async def _fetch_lt_rates():
         try:
-            return await LighterScanner().get_funding_rates()
+            return await BitMartScanner().get_funding_rates()
         except Exception:
             return []
 
@@ -1024,7 +1100,7 @@ async def show_positions(update: Update):
         _fetch_ext_rates(),
     )
 
-    rates_map = {f"Lighter:{r.symbol}": r for r in lt_rates}
+    rates_map = {f"BitMart:{r.symbol}": r for r in lt_rates}
     rates_map.update({f"Backpack:{r.symbol}": r for r in bp_rates})
     rates_map.update({f"Hyperliquid:{r.symbol}": r for r in hl_rates})
     rates_map.update({f"Variational:{r.symbol}": r for r in vr_rates})
@@ -1071,19 +1147,20 @@ async def show_positions(update: Update):
                 dir_b = "шорт ↓" if leg_b["direction"] == "SHORT" else "лонг ↑"
 
                 # ── Заработано (оценка по текущему фандингу × время) ─────────
-                vr_earned = ext_earned = None
-                if vr_leg and vr_rate:
-                    sign = 1 if vr_leg["direction"] == "SHORT" else -1
-                    vr_earned = sign * vr_rate.rate * opened_ago * vr_leg["position_size_usd"]
-                if ext_leg and ext_rate:
-                    sign = 1 if ext_leg["direction"] == "SHORT" else -1
-                    ext_earned = sign * ext_rate.rate * opened_ago * ext_leg["position_size_usd"]
+                vr_earned = _estimated_leg_funding_usd(vr_leg, vr_rate, opened_ago)
+                ext_earned = _estimated_leg_funding_usd(ext_leg, ext_rate, opened_ago)
+                net_funding_pct = _net_funding_pct(
+                    None if (vr_earned is None or ext_earned is None) else (vr_earned + ext_earned),
+                    legs,
+                )
 
                 if vr_earned is not None and ext_earned is not None:
                     total_earned = vr_earned + ext_earned
                     earned_str = (
-                        f"`${total_earned:.4f}` (~оценка)\n"
-                        f"  ├ Variational: `${vr_earned:.4f}` (~)\n"
+                        f"`${total_earned:.4f}` (~оценка, `{net_funding_pct:.3f}%`)" if net_funding_pct is not None else f"`${total_earned:.4f}` (~оценка)"
+                    )
+                    earned_str += (
+                        f"\n  ├ Variational: `${vr_earned:.4f}` (~)\n"
                         f"  └ Extended: `${ext_earned:.4f}` (~)"
                     )
                 else:
@@ -1128,7 +1205,7 @@ async def show_positions(update: Update):
 
             # ── Backpack: берём реальный cumulativeFundingPayment если доступен ──
             bp_leg = next((l for l in legs if l["exchange"] == "Backpack"), None)
-            lt_leg = next((l for l in legs if l["exchange"] == "Lighter"), None)
+            lt_leg = next((l for l in legs if l["exchange"] == "BitMart"), None)
             bp_funding = None
             bp_data = bp_real_map.get(symbol)
             if bp_data is not None:
@@ -1149,7 +1226,7 @@ async def show_positions(update: Update):
                 except (ValueError, TypeError):
                     pass
 
-            # Отклонение цены для Lighter ноги (API не даёт liquidationPrice)
+            # Отклонение цены для BitMart ноги
             lt_liq_info = ""
             if lt_leg:
                 try:
@@ -1164,9 +1241,9 @@ async def show_positions(update: Update):
                             lt_move = (cur_price - lt_entry) / lt_entry * 100
                         if lt_move > 0:
                             m_emoji = "🔴" if lt_move >= LT_AUTO_CLOSE_PCT else "🟡" if lt_move >= LT_WARN_MOVE_PCT else "🟢"
-                            lt_liq_info = f"\n{m_emoji} Lighter: `-{lt_move:.1f}%` против позиции"
+                            lt_liq_info = f"\n{m_emoji} BitMart: `-{lt_move:.1f}%` против позиции"
                         else:
-                            lt_liq_info = f"\n🟢 Lighter: `+{abs(lt_move):.1f}%` в пользу позиции"
+                            lt_liq_info = f"\n🟢 BitMart: `+{abs(lt_move):.1f}%` в пользу позиции"
                 except (ValueError, TypeError):
                     pass
 
@@ -1175,20 +1252,18 @@ async def show_positions(update: Update):
                 key = f"Backpack:{bp_leg['symbol']}"
                 r = rates_map.get(key)
                 if r:
-                    sign = 1 if bp_leg["direction"] == "SHORT" else -1
-                    bp_funding = sign * r.rate * opened_ago * bp_leg["position_size_usd"]
+                    bp_funding = _estimated_leg_funding_usd(bp_leg, r, opened_ago)
 
-            # ── Lighter: только оценка (REST API недоступен) ─────────────────────
+            # ── BitMart: оценка заработка по текущему фандингу ────────────────────
             lt_funding = None
             if lt_leg:
-                key = f"Lighter:{lt_leg['symbol']}"
+                key = f"BitMart:{lt_leg['symbol']}"
                 r = rates_map.get(key)
                 if r:
-                    sign = 1 if lt_leg["direction"] == "SHORT" else -1
-                    lt_funding = sign * r.rate * opened_ago * lt_leg["position_size_usd"]
+                    lt_funding = _estimated_leg_funding_usd(lt_leg, r, opened_ago)
 
             # ── Текущий APR каждой ноги ──────────────────────────────────────────
-            lt_rate_obj = rates_map.get(f"Lighter:{symbol}") if lt_leg else None
+            lt_rate_obj = rates_map.get(f"BitMart:{symbol}") if lt_leg else None
             bp_rate_obj = rates_map.get(f"Backpack:{symbol}") if bp_leg else None
 
             # Доход = SHORT на положительном фандинге (или LONG на отрицательном)
@@ -1211,13 +1286,17 @@ async def show_positions(update: Update):
                 bp_data.get("cumulativeFundingPayment") is not None or
                 bp_data.get("fundingPayment") is not None
             )
+            net_funding_pct = _net_funding_pct(
+                None if (bp_funding is None or lt_funding is None) else (bp_funding + lt_funding),
+                legs,
+            )
             if bp_funding is not None and lt_funding is not None:
                 total_earned = bp_funding + lt_funding
                 bp_label = "факт." if bp_is_real else "~"
                 earned_str = (
-                    f"`${total_earned:.4f}`\n"
+                    f"`${total_earned:.4f}`" + (f" (`{net_funding_pct:.3f}%`)" if net_funding_pct is not None else "") + "\n"
                     f"  ├ Backpack: `${bp_funding:.4f}` ({bp_label})\n"
-                    f"  └ Lighter: `${lt_funding:.4f}` (~прибл.)"
+                    f"  └ BitMart: `${lt_funding:.4f}` (~прибл.)"
                 )
             elif bp_funding is not None:
                 bp_label = "факт." if bp_is_real else "~прибл."
@@ -1236,7 +1315,7 @@ async def show_positions(update: Update):
                 f"  {leg_b['exchange']} ({dir_b}): `${leg_b['entry_price']:.4f}`\n"
                 f"💵 Размер: `${total_usd:.0f}` (по `${leg_a['position_size_usd']:.0f}` на каждую)\n"
                 f"⏱ Открыта: `{opened_ago:.1f}ч назад`\n"
-                f"📊 APR сейчас: Lighter {lt_apr_str} | Backpack {bp_apr_str}\n"
+                f"📊 APR сейчас: BitMart {lt_apr_str} | Backpack {bp_apr_str}\n"
                 f"  └ Нетто: `{net_apr:+.1f}%`\n"
                 f"💰 *Заработано:* {earned_str}"
                 f"{bp_liq_info}"
@@ -1401,7 +1480,7 @@ async def scan_manual(update: Update):
 
     try:
         lt_rates, bp_rates, vr_rates, ext_rates = await asyncio.gather(
-            LighterScanner().get_funding_rates(),
+            BitMartScanner().get_funding_rates(),
             BackpackScanner().get_funding_rates(),
             VariationalScanner().get_funding_rates(),
             ExtendedScanner().get_funding_rates(),
@@ -1462,15 +1541,15 @@ async def scan_manual(update: Update):
         label_a = "шорт ↓" if opp["dir_a"] == "SHORT" else "лонг ↑"
         label_b = "шорт ↓" if opp["dir_b"] == "SHORT" else "лонг ↑"
         text = (
-            f"🔀 *{opp['symbol']}* — Lighter × Backpack\n\n"
-            f"  Lighter ({label_a}): `{opp['apr_a']:+.1f}%`\n"
+            f"🔀 *{opp['symbol']}* — BitMart × Backpack\n\n"
+            f"  BitMart ({label_a}): `{opp['apr_a']:+.1f}%`\n"
             f"  Backpack ({label_b}): `{opp['apr_b']:+.1f}%`\n"
             f"  📈 Нетто: `~{opp['net_apr']:.1f}% APR`\n\n"
-            f"  💸 Lighter: 0% комиссия | Backpack: 0.04%"
+            f"  💸 BitMart: 0.06% | Backpack: 0.04%"
         )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Открыть пару",
-                callback_data=f"open_pair:Lighter:Backpack:{opp['symbol']}:{opp['dir_a']}:{opp['dir_b']}"),
+                callback_data=f"open_pair:BitMart:Backpack:{opp['symbol']}:{opp['dir_a']}:{opp['dir_b']}"),
             InlineKeyboardButton("❌ Пропустить", callback_data="skip"),
         ]])
         _sent_signals[f"LT_BP:{opp['symbol']}:{opp['dir_a']}:{opp['dir_b']}"] = (opp["net_apr"], time.time())
@@ -1496,7 +1575,7 @@ async def scan_manual(update: Update):
 
     lt_str = f"{min(len(lt_bp_opps), 5)} из {len(lt_bp_opps)}" if _signals_enabled["LT_BP"] else "выкл"
     vr_str = f"{min(len(vr_ext_opps), 5)} из {len(vr_ext_opps)}" if _signals_enabled["VR_EXT"] else "выкл"
-    await update.message.reply_text(f"✅ LT×BP: {lt_str} | VR×EXT: {vr_str}")
+    await update.message.reply_text(f"✅ BM×BP: {lt_str} | VR×EXT: {vr_str}")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1532,11 +1611,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = await scale_in_pair(
                     pair_id=pair_id, symbol=symbol, legs=legs, add_size_usd=add_size,
                 )
-                lt = result["lighter"]
+                lt = result["bitmart"]
                 bp = result["backpack"]
                 await update.message.reply_text(
-                    f"✅ {symbol} (LT+BP) увеличен на ${add_size:.0f}!\n"
-                    f"Lighter: {lt['size']:.4f} @ ${lt['price']:.4f}\n"
+                    f"✅ {symbol} (BM+BP) увеличен на ${add_size:.0f}!\n"
+                    f"BitMart: {lt['size']:.4f} @ ${lt['price']:.4f}\n"
                     f"Backpack: {bp['size']:.4f} @ ${bp['price']:.4f}"
                 )
         except ValueError:
@@ -1601,7 +1680,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif _waiting_for_size:
         # Пользователь вводит размер позиции вручную
         pair_type = _waiting_for_size
-        pair_label = "Lighter × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
+        pair_label = "BitMart × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
         try:
             new_size = float(text.replace("$", "").replace(",", "").strip())
             if new_size < 10:
@@ -1638,13 +1717,13 @@ async def _do_open_pair(query, symbol: str, lt_dir: str, bp_dir: str):
             size_usd=_position_sizes["LT_BP"],
             entry_apr=entry_apr,
         )
-        lt = result["lighter"]
+        lt = result["bitmart"]
         bp = result["backpack"]
         await query.edit_message_text(
             text=query.message.text +
                  f"\n\n_✅ Пара открыта!_\n"
-                 f"_Lighter: {lt['size']:.4f} {symbol} @ ${lt['price']:.4f}_\n"
-                 f"_Backpack: {bp['size']:.4f} {symbol} @ ${bp['price']:.4f}_",
+                f"_BitMart: {lt['size']:.4f} {symbol} @ ${lt['price']:.4f}_\n"
+                f"_Backpack: {bp['size']:.4f} {symbol} @ ${bp['price']:.4f}_",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
@@ -1750,13 +1829,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_vr_ext = (exch_a == "Variational" and exch_b == "Extended")
 
-        # Для LT+BP: проверяем нет ли уже открытой пары (scale_in)
+        # Для BM+BP: проверяем нет ли уже открытой пары (scale_in)
         if not is_vr_ext:
             open_pairs = await get_open_pairs()
             existing = next(
                 (p for p in open_pairs
                  if p["legs"] and p["legs"][0]["symbol"] == symbol and p["pair_id"]
-                 and {l["exchange"] for l in p["legs"]} == {"Lighter", "Backpack"}),
+                 and {l["exchange"] for l in p["legs"]} == {"BitMart", "Backpack"}),
                 None
             )
             if existing:
@@ -1803,7 +1882,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # scale_in:{pair_id}:{symbol} — показываем выбор суммы
         _, pair_id, symbol = query.data.split(":", 2)
         is_vr_ext = pair_id.endswith("_VR_EXT")
-        pair_label = "VR+EXT" if is_vr_ext else "LT+BP"
+        pair_label = "VR+EXT" if is_vr_ext else "BM+BP"
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("$15",  callback_data=f"scale_in_exec:{pair_id}:{symbol}:15"),
@@ -1857,11 +1936,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     result = await scale_in_pair(
                         pair_id=pair_id, symbol=symbol, legs=legs, add_size_usd=add_size,
                     )
-                    lt = result["lighter"]
+                    lt = result["bitmart"]
                     bp = result["backpack"]
                     await query.edit_message_text(
-                        f"✅ {symbol} (LT+BP) увеличен на ${add_size:.0f}!\n"
-                        f"Lighter: {lt['size']:.4f} @ ${lt['price']:.4f}\n"
+                        f"✅ {symbol} (BM+BP) увеличен на ${add_size:.0f}!\n"
+                        f"BitMart: {lt['size']:.4f} @ ${lt['price']:.4f}\n"
                         f"Backpack: {bp['size']:.4f} @ ${bp['price']:.4f}"
                     )
             except Exception as e:
@@ -1907,7 +1986,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = query.data.split(":")
         pair_type = parts[1]   # LT_BP или VR_EXT
         value = parts[2]
-        pair_label = "Lighter × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
+        pair_label = "BitMart × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
         if value == "manual":
             global _waiting_for_size
             _waiting_for_size = pair_type
@@ -1931,7 +2010,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pair_type = query.data.split(":")[1]   # LT_BP или VR_EXT
         _signals_enabled[pair_type] = not _signals_enabled[pair_type]
         await save_setting(f"signals_enabled_{pair_type}", "1" if _signals_enabled[pair_type] else "0")
-        pair_label = "Lighter × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
+        pair_label = "BitMart × Backpack" if pair_type == "LT_BP" else "Variational × Extended"
         state = "включены ✅" if _signals_enabled[pair_type] else "выключены ❌"
         # Обновляем клавиатуру настроек
         lt_bp_on = _signals_enabled["LT_BP"]
@@ -1942,7 +2021,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("── Биржи ──", callback_data="noop")],
             [
                 InlineKeyboardButton(
-                    f"{'✅' if lt_bp_on else '❌'} Lighter × Backpack",
+                    f"{'✅' if lt_bp_on else '❌'} BitMart × Backpack",
                     callback_data="toggle_signals:LT_BP"
                 ),
                 InlineKeyboardButton(
@@ -1951,7 +2030,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             ],
             [InlineKeyboardButton("── Размер позиций ──", callback_data="noop")],
-            [InlineKeyboardButton(f"── Lighter × Backpack (${lt_bp:.0f}) ──", callback_data="noop")],
+            [InlineKeyboardButton(f"── BitMart × Backpack (${lt_bp:.0f}) ──", callback_data="noop")],
             [
                 InlineKeyboardButton("$15",  callback_data="setsize:LT_BP:15"),
                 InlineKeyboardButton("$50",  callback_data="setsize:LT_BP:50"),
@@ -1959,7 +2038,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("$250", callback_data="setsize:LT_BP:250"),
                 InlineKeyboardButton("$500", callback_data="setsize:LT_BP:500"),
             ],
-            [InlineKeyboardButton("✏️ Ввести вручную (LT+BP)", callback_data="setsize:LT_BP:manual")],
+            [InlineKeyboardButton("✏️ Ввести вручную (BM+BP)", callback_data="setsize:LT_BP:manual")],
             [InlineKeyboardButton(f"── Variational × Extended (${vr_ext:.0f}) ──", callback_data="noop")],
             [
                 InlineKeyboardButton("$15",  callback_data="setsize:VR_EXT:15"),
@@ -1973,7 +2052,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⚙️ *Настройки*\n\n"
             f"Сигналы {pair_label}: {state}\n\n"
-            f"Lighter × Backpack: `${lt_bp:.0f}` на каждую ногу\n"
+            f"BitMart × Backpack: `${lt_bp:.0f}` на каждую ногу\n"
             f"Variational × Extended: `${vr_ext:.0f}` на каждую ногу\n\n"
             f"Выбери размер или включи/выключи сигналы:",
             parse_mode=ParseMode.MARKDOWN,
@@ -2010,12 +2089,12 @@ async def main():
     vr_ext_size = await load_setting("position_size_VR_EXT", str(POSITION_SIZE_USD))
     _position_sizes["LT_BP"] = float(lt_bp_size)
     _position_sizes["VR_EXT"] = float(vr_ext_size)
-    logger.info(f"Размеры позиций: LT×BP=${_position_sizes['LT_BP']:.0f}, VR×EXT=${_position_sizes['VR_EXT']:.0f}")
+    logger.info(f"Размеры позиций: BM×BP=${_position_sizes['LT_BP']:.0f}, VR×EXT=${_position_sizes['VR_EXT']:.0f}")
 
     # Восстанавливаем настройки сигналов
     _signals_enabled["LT_BP"] = (await load_setting("signals_enabled_LT_BP", "1")) == "1"
     _signals_enabled["VR_EXT"] = (await load_setting("signals_enabled_VR_EXT", "1")) == "1"
-    logger.info(f"Сигналы: LT×BP={'вкл' if _signals_enabled['LT_BP'] else 'выкл'}, VR×EXT={'вкл' if _signals_enabled['VR_EXT'] else 'выкл'}")
+    logger.info(f"Сигналы: BM×BP={'вкл' if _signals_enabled['LT_BP'] else 'выкл'}, VR×EXT={'вкл' if _signals_enabled['VR_EXT'] else 'выкл'}")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))

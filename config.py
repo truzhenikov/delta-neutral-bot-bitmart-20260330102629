@@ -21,10 +21,10 @@ POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", 100))
 BACKPACK_API_KEY = os.getenv("BACKPACK_API_KEY", "")     # Base64 Ed25519 public key
 BACKPACK_API_SECRET = os.getenv("BACKPACK_API_SECRET", "") # Base64 Ed25519 private key
 
-# Lighter DEX
-LIGHTER_API_PRIVATE_KEY = os.getenv("LIGHTER_API_PRIVATE_KEY", "")
-LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "2"))
-LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
+# BitMart Futures
+BITMART_API_KEY = os.getenv("BITMART_API_KEY", "")
+BITMART_API_SECRET = os.getenv("BITMART_API_SECRET", "")
+BITMART_API_MEMO = os.getenv("BITMART_API_MEMO", "")
 
 # Variational DEX
 VARIATIONAL_TOKEN = os.getenv("VARIATIONAL_TOKEN", "")              # vr-token из браузера (начальный)

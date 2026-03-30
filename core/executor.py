@@ -10,11 +10,11 @@ from hyperliquid.utils import constants
 from config import (
     HYPERLIQUID_PRIVATE_KEY, WALLET_ADDRESS, POSITION_SIZE_USD,
     BACKPACK_API_KEY, BACKPACK_API_SECRET,
-    LIGHTER_API_PRIVATE_KEY, LIGHTER_API_KEY_INDEX, LIGHTER_ACCOUNT_INDEX,
+    BITMART_API_KEY, BITMART_API_SECRET, BITMART_API_MEMO,
     VARIATIONAL_TOKEN, VARIATIONAL_WALLET, VARIATIONAL_CF_CLEARANCE, VARIATIONAL_PRIVATE_KEY,
     EXTENDED_API_KEY, EXTENDED_PUBLIC_KEY, EXTENDED_PRIVATE_KEY, EXTENDED_VAULT_ID,
 )
-from db.database import save_position, save_pair, scale_pair_db, scale_pair_db_generic, close_position, close_pair as db_close_pair
+from db.database import save_position, save_pair, scale_pair_db_generic, close_position, close_pair as db_close_pair
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ async def close_full_position(position_id: int, symbol: str) -> dict:
     return {"position_id": position_id, "symbol": symbol}
 
 
-# ─── Lighter + Backpack (дельта-нейтральная пара, Фаза 2) ─────────────────────
+# ─── BitMart + Backpack (дельта-нейтральная пара, Фаза 2) ─────────────────────
 
 def _get_backpack():
     from core.exchanges.backpack import BackpackExecutor
@@ -82,42 +82,51 @@ def _get_backpack():
     return BackpackExecutor(BACKPACK_API_KEY, BACKPACK_API_SECRET)
 
 
-def _get_lighter():
-    from core.exchanges.lighter import LighterExecutor
-    if not LIGHTER_API_PRIVATE_KEY:
-        raise RuntimeError("Lighter API ключ не задан в .env")
-    return LighterExecutor(
-        LIGHTER_API_PRIVATE_KEY,
-        LIGHTER_API_KEY_INDEX,
-        LIGHTER_ACCOUNT_INDEX,
-    )
+def _get_bitmart():
+    from core.exchanges.bitmart import BitMartExecutor
+    if not BITMART_API_KEY or not BITMART_API_SECRET or not BITMART_API_MEMO:
+        raise RuntimeError("BitMart: BITMART_API_KEY, BITMART_API_SECRET и BITMART_API_MEMO должны быть заданы в .env")
+    return BitMartExecutor(BITMART_API_KEY, BITMART_API_SECRET, BITMART_API_MEMO)
 
 
 async def open_pair(
     symbol: str,
-    lighter_dir: str,   # "LONG" или "SHORT"
+    lighter_dir: str,   # "LONG" или "SHORT" на BitMart
     backpack_dir: str,  # "LONG" или "SHORT"
     size_usd: float,
     entry_apr: float,
 ) -> dict:
     """
-    Открывает дельта-нейтральную пару Lighter + Backpack одновременно.
+    Открывает дельта-нейтральную пару BitMart + Backpack одновременно.
     Возвращает pair_id по которому можно закрыть обе ноги.
     """
-    lighter = _get_lighter()
+    bitmart = _get_bitmart()
     backpack = _get_backpack()
 
-    lighter_is_long = (lighter_dir == "LONG")
+    bitmart_is_long = (lighter_dir == "LONG")
     backpack_is_long = (backpack_dir == "LONG")
 
     logger.info(
         f"Открываем пару {symbol}: "
-        f"Lighter {'лонг' if lighter_is_long else 'шорт'}, "
+        f"BitMart {'лонг' if bitmart_is_long else 'шорт'}, "
         f"Backpack {'лонг' if backpack_is_long else 'шорт'}, "
         f"${size_usd}"
     )
 
-    # ── Проверка баланса Backpack перед открытием ─────────────────────────────
+    # ── Проверка балансов перед открытием ──────────────────────────────────────
+    try:
+        bm_balance = await bitmart.get_usdt_balance()
+        logger.info(f"BitMart баланс: ${bm_balance:.2f} USDT (нужно: ${size_usd:.2f})")
+        if bm_balance < size_usd * 0.05:
+            raise RuntimeError(
+                f"BitMart: недостаточно баланса. "
+                f"Есть: ${bm_balance:.2f}, нужно как минимум: ${size_usd * 0.05:.2f}."
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning(f"Не удалось проверить баланс BitMart: {e} — продолжаем")
+
     try:
         bp_balance = await backpack.get_usdc_balance()
         logger.info(f"Backpack баланс: ${bp_balance:.2f} USDC (нужно: ${size_usd:.2f})")
@@ -140,7 +149,7 @@ async def open_pair(
 
     # Открываем обе ноги параллельно, перехватываем ошибки каждой
     lt_result, bp_result = await asyncio.gather(
-        lighter.market_open(symbol, lighter_is_long, size_usd),
+        bitmart.market_open(symbol, bitmart_is_long, size_usd),
         backpack.market_open(symbol, backpack_is_long, size_usd),
         return_exceptions=True,
     )
@@ -150,60 +159,55 @@ async def open_pair(
 
     # Если одна нога упала — закрываем вторую и сообщаем об ошибке
     if lt_ok and not bp_ok:
-        logger.error(f"Backpack не открылся: {bp_result} — закрываем Lighter автоматически")
+        logger.error(f"Backpack не открылся: {bp_result} — закрываем BitMart автоматически")
         try:
-            await lighter.market_close(symbol, lt_result["size"], lighter_is_long)
-            logger.info(f"Lighter автоматически закрыт после ошибки Backpack")
+            await bitmart.market_close(symbol, lt_result["size"], bitmart_is_long)
+            logger.info("BitMart автоматически закрыт после ошибки Backpack")
         except Exception as e:
-            logger.error(f"Не удалось закрыть Lighter после ошибки Backpack: {e}")
-            # 🚨 КРИТИЧНО: нога открыта, но закрыть не удалось — незахеджированная позиция!
+            logger.error(f"Не удалось закрыть BitMart после ошибки Backpack: {e}")
             try:
                 from bot.telegram import send_message
                 await send_message(
                     f"🚨 *КРИТИЧНО! НЕЗАХЕДЖИРОВАННАЯ ПОЗИЦИЯ!*\n\n"
-                    f"*{symbol}* — Lighter открылся, Backpack упал.\n"
-                    f"Автозакрытие Lighter тоже провалилось!\n\n"
+                    f"*{symbol}* — BitMart открылся, Backpack упал.\n"
+                    f"Автозакрытие BitMart тоже провалилось!\n\n"
                     f"❌ Backpack: `{bp_result}`\n"
                     f"❌ Автозакрытие: `{e}`\n\n"
-                    f"⚠️ *Немедленно закрой {symbol} на Lighter вручную!*"
+                    f"⚠️ *Немедленно закрой {symbol} на BitMart вручную!*"
                 )
             except Exception:
                 pass
-        await lighter.close()
-        raise RuntimeError(f"Backpack ошибка: {bp_result}\nLighter закрыт автоматически.")
+        raise RuntimeError(f"Backpack ошибка: {bp_result}\nBitMart закрыт автоматически.")
 
     if not lt_ok and bp_ok:
-        logger.error(f"Lighter не открылся: {lt_result} — закрываем Backpack автоматически")
+        logger.error(f"BitMart не открылся: {lt_result} — закрываем Backpack автоматически")
         try:
             await backpack.market_close(symbol)
-            logger.info(f"Backpack автоматически закрыт после ошибки Lighter")
+            logger.info("Backpack автоматически закрыт после ошибки BitMart")
         except Exception as e:
-            logger.error(f"Не удалось закрыть Backpack после ошибки Lighter: {e}")
-            # 🚨 КРИТИЧНО: нога открыта, но закрыть не удалось — незахеджированная позиция!
+            logger.error(f"Не удалось закрыть Backpack после ошибки BitMart: {e}")
             try:
                 from bot.telegram import send_message
                 await send_message(
                     f"🚨 *КРИТИЧНО! НЕЗАХЕДЖИРОВАННАЯ ПОЗИЦИЯ!*\n\n"
-                    f"*{symbol}* — Backpack открылся, Lighter упал.\n"
+                    f"*{symbol}* — Backpack открылся, BitMart упал.\n"
                     f"Автозакрытие Backpack тоже провалилось!\n\n"
-                    f"❌ Lighter: `{lt_result}`\n"
+                    f"❌ BitMart: `{lt_result}`\n"
                     f"❌ Автозакрытие: `{e}`\n\n"
                     f"⚠️ *Немедленно закрой {symbol} на Backpack вручную!*"
                 )
             except Exception:
                 pass
-        await lighter.close()
-        raise RuntimeError(f"Lighter ошибка: {lt_result}\nBackpack закрыт автоматически.")
+        raise RuntimeError(f"BitMart ошибка: {lt_result}\nBackpack закрыт автоматически.")
 
     if not lt_ok and not bp_ok:
-        await lighter.close()
-        raise RuntimeError(f"Обе ноги не открылись.\nLighter: {lt_result}\nBackpack: {bp_result}")
+        raise RuntimeError(f"Обе ноги не открылись.\nBitMart: {lt_result}\nBackpack: {bp_result}")
 
     # Обе ноги открыты успешно — сохраняем атомарно в одной транзакции
     pair_id = f"{int(time.time())}_{symbol}_LT_BP"
     await save_pair(pair_id, [
         {
-            "symbol": symbol, "exchange": "Lighter", "direction": lighter_dir,
+            "symbol": symbol, "exchange": "BitMart", "direction": lighter_dir,
             "size": lt_result["size"], "entry_price": lt_result["price"],
             "position_size_usd": size_usd, "entry_apr": entry_apr,
         },
@@ -214,38 +218,35 @@ async def open_pair(
         },
     ])
 
-    await lighter.close()
     logger.info(f"✅ Пара открыта: {pair_id}")
     return {
         "pair_id": pair_id,
         "symbol": symbol,
-        "lighter": lt_result,
+        "bitmart": lt_result,
         "backpack": bp_result,
     }
 
 
 async def close_pair(pair_id: str, symbol: str, legs: list[dict]) -> dict:
     """
-    Закрывает обе ноги дельта-нейтральной пары Lighter + Backpack.
+    Закрывает обе ноги дельта-нейтральной пары BitMart + Backpack.
     legs: список позиций из БД (обе ноги).
     """
-    lighter = _get_lighter()
+    bitmart = _get_bitmart()
     backpack = _get_backpack()
 
-    lighter_leg = next((l for l in legs if l["exchange"] == "Lighter"), None)
+    lighter_leg = next((l for l in legs if l["exchange"] == "BitMart"), None)
     backpack_leg = next((l for l in legs if l["exchange"] == "Backpack"), None)
 
     tasks = []
     if lighter_leg:
         was_long = (lighter_leg["direction"] == "LONG")
-        tasks.append(lighter.market_close(symbol, lighter_leg["size"], was_long))
+        tasks.append(bitmart.market_close(symbol, lighter_leg["size"], was_long))
     if backpack_leg:
         tasks.append(backpack.market_close(symbol))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     errors = [str(r) for r in results if isinstance(r, Exception)]
-
-    await lighter.close()
 
     if errors:
         # Одна или обе ноги не закрылись — НЕ помечаем пару закрытой в БД
@@ -270,7 +271,7 @@ async def close_pair(pair_id: str, symbol: str, legs: list[dict]) -> dict:
             leg_pnl[lighter_leg["id"]] = {
                 "exit_price": exit_price,
                 "pnl_price_usd": round(pnl_price, 6),
-                "fees_usd": 0.0,  # Lighter: 0% комиссия
+                "fees_usd": round(lt_res.get("fee") or 0.0, 6),
             }
 
     if backpack_leg:
@@ -300,18 +301,18 @@ async def scale_in_pair(pair_id: str, symbol: str, legs: list, add_size_usd: flo
     Увеличивает существующую дельта-нейтральную пару на add_size_usd (на каждую биржу).
     Обновляет средневзвешенную цену входа и размер в БД.
     """
-    lighter_leg = next((l for l in legs if l["exchange"] == "Lighter"), None)
+    lighter_leg = next((l for l in legs if l["exchange"] == "BitMart"), None)
     backpack_leg = next((l for l in legs if l["exchange"] == "Backpack"), None)
     if not lighter_leg or not backpack_leg:
         raise RuntimeError("Не найдены обе ноги пары")
 
-    lighter = _get_lighter()
+    bitmart = _get_bitmart()
     backpack = _get_backpack()
     lighter_is_long = (lighter_leg["direction"] == "LONG")
     backpack_is_long = (backpack_leg["direction"] == "LONG")
 
     lt_result, bp_result = await asyncio.gather(
-        lighter.market_open(symbol, lighter_is_long, add_size_usd),
+        bitmart.market_open(symbol, lighter_is_long, add_size_usd),
         backpack.market_open(symbol, backpack_is_long, add_size_usd),
         return_exceptions=True,
     )
@@ -321,35 +322,36 @@ async def scale_in_pair(pair_id: str, symbol: str, legs: list, add_size_usd: flo
 
     # Откат при частичном сбое
     if lt_ok and not bp_ok:
-        logger.error(f"Scale in Backpack не открылся: {bp_result} — откатываем Lighter")
+        logger.error(f"Scale in Backpack не открылся: {bp_result} — откатываем BitMart")
         try:
-            await lighter.market_close(symbol, lt_result["size"], lighter_is_long)
+            await bitmart.market_close(symbol, lt_result["size"], lighter_is_long)
         except Exception as e:
-            logger.error(f"Не удалось откатить Lighter при scale_in: {e}")
+            logger.error(f"Не удалось откатить BitMart при scale_in: {e}")
         raise RuntimeError(f"Scale in отменён. Backpack: {bp_result}")
 
     if bp_ok and not lt_ok:
-        logger.error(f"Scale in Lighter не открылся: {lt_result} — откатываем Backpack")
+        logger.error(f"Scale in BitMart не открылся: {lt_result} — откатываем Backpack")
         try:
             # Передаём точный размер scale_in, чтобы не закрыть основную позицию
             await backpack.market_close(symbol, close_qty=bp_result["size"])
         except Exception as e:
             logger.error(f"Не удалось откатить Backpack при scale_in: {e}")
-        raise RuntimeError(f"Scale in отменён. Lighter: {lt_result}")
+        raise RuntimeError(f"Scale in отменён. BitMart: {lt_result}")
 
     if not lt_ok and not bp_ok:
-        raise RuntimeError(f"Scale in: обе ноги не открылись.\nLighter: {lt_result}\nBackpack: {bp_result}")
+        raise RuntimeError(f"Scale in: обе ноги не открылись.\nBitMart: {lt_result}\nBackpack: {bp_result}")
 
-    await scale_pair_db(
-        pair_id=pair_id, legs=legs,
-        lt_new_size=lt_result["size"], lt_new_price=lt_result["price"],
-        bp_new_size=bp_result["size"], bp_new_price=bp_result["price"],
+    await scale_pair_db_generic(
+        legs=legs,
+        results_by_exchange={
+            "BitMart": {"size": lt_result["size"], "price": lt_result["price"]},
+            "Backpack": {"size": bp_result["size"], "price": bp_result["price"]},
+        },
         add_size_usd=add_size_usd,
     )
 
-    await lighter.close()
     logger.info(f"✅ Scale in выполнен: {pair_id} +${add_size_usd}")
-    return {"pair_id": pair_id, "symbol": symbol, "lighter": lt_result, "backpack": bp_result, "added_usd": add_size_usd}
+    return {"pair_id": pair_id, "symbol": symbol, "bitmart": lt_result, "backpack": bp_result, "added_usd": add_size_usd}
 
 
 # ─── Variational + Extended (дельта-нейтральная пара) ─────────────────────────
