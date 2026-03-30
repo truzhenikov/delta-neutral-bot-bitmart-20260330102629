@@ -35,12 +35,16 @@ class BitMartScanner(BaseScanner):
                 funding_rate = float(item.get("funding_rate") or 0)
                 interval_hours = int(item.get("funding_interval_hours") or 8)
                 mark_price = float(item.get("last_price") or item.get("index_price") or 0)
-                apr = funding_rate * (24 / interval_hours) * 365 * 100
+
+                # BitMart funding_rate приходит за funding_interval_hours (обычно 8ч).
+                # Для единого исчисления по боту храним rate как почасовую ставку.
+                hourly_rate = funding_rate / interval_hours if interval_hours > 0 else 0.0
+                apr = hourly_rate * 24 * 365 * 100
 
                 rates.append(FundingRate(
                     exchange="BitMart",
                     symbol=symbol,
-                    rate=funding_rate,
+                    rate=hourly_rate,
                     interval_hours=interval_hours,
                     apr=apr,
                     open_interest_usd=float(item.get("open_interest_value") or 0),
