@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _sent_signals: dict[str, tuple[float, float]] = {}
 SIGNAL_COOLDOWN_HOURS = 4
 APR_GROWTH_THRESHOLD = 0.5
+TOP_OPPORTUNITIES_TO_SHOW = 10
 
 # Верификация позиций: не спамить одно и то же расхождение чаще раза в 5 минут
 _verify_alerts_sent: dict[str, float] = {}
@@ -743,7 +744,7 @@ async def _scan_pair_opportunities(lighter_rates: list, backpack_rates: list):
     opps.sort(key=lambda x: x["net_apr"], reverse=True)
     logger.info(f"BitMart×Backpack: найдено {len(opps)} возможностей")
 
-    for opp in opps[:3]:
+    for opp in opps[:TOP_OPPORTUNITIES_TO_SHOW]:
         signal_key = f"LT_BP:{opp['symbol']}:{opp['lt_dir']}:{opp['bp_dir']}"
         if not should_send_signal(signal_key, opp["net_apr"]):
             continue
@@ -1537,7 +1538,7 @@ async def scan_manual(update: Update):
         await update.message.reply_text("🤷 Возможностей не найдено (или все связки выключены в настройках)")
         return
 
-    for opp in lt_bp_opps[:5]:
+    for opp in lt_bp_opps[:TOP_OPPORTUNITIES_TO_SHOW]:
         label_a = "шорт ↓" if opp["dir_a"] == "SHORT" else "лонг ↑"
         label_b = "шорт ↓" if opp["dir_b"] == "SHORT" else "лонг ↑"
         text = (
@@ -1555,7 +1556,7 @@ async def scan_manual(update: Update):
         _sent_signals[f"LT_BP:{opp['symbol']}:{opp['dir_a']}:{opp['dir_b']}"] = (opp["net_apr"], time.time())
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-    for opp in vr_ext_opps[:5]:
+    for opp in vr_ext_opps[:TOP_OPPORTUNITIES_TO_SHOW]:
         label_a = "шорт ↓" if opp["dir_a"] == "SHORT" else "лонг ↑"
         label_b = "шорт ↓" if opp["dir_b"] == "SHORT" else "лонг ↑"
         text = (
@@ -1573,8 +1574,8 @@ async def scan_manual(update: Update):
         _sent_signals[f"VR_EXT:{opp['symbol']}:{opp['dir_a']}:{opp['dir_b']}"] = (opp["net_apr"], time.time())
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-    lt_str = f"{min(len(lt_bp_opps), 5)} из {len(lt_bp_opps)}" if _signals_enabled["LT_BP"] else "выкл"
-    vr_str = f"{min(len(vr_ext_opps), 5)} из {len(vr_ext_opps)}" if _signals_enabled["VR_EXT"] else "выкл"
+    lt_str = f"{min(len(lt_bp_opps), TOP_OPPORTUNITIES_TO_SHOW)} из {len(lt_bp_opps)}" if _signals_enabled["LT_BP"] else "выкл"
+    vr_str = f"{min(len(vr_ext_opps), TOP_OPPORTUNITIES_TO_SHOW)} из {len(vr_ext_opps)}" if _signals_enabled["VR_EXT"] else "выкл"
     await update.message.reply_text(f"✅ BM×BP: {lt_str} | VR×EXT: {vr_str}")
 
 
