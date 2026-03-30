@@ -189,21 +189,35 @@ class BackpackExecutor:
         return {"symbol": symbol, "closed_qty": abs(qty), "price": exit_price, "fee": fees_paid}
 
     async def get_usdc_balance(self) -> float:
-        """Возвращает свободный USDC баланс (available для новых позиций)."""
+        """
+        Возвращает доступный баланс для фьючерсной ноги на Backpack.
+
+        Важно: используем collateral endpoint и netEquityAvailable,
+        т.к. /api/v1/capital может показывать 0 available при lend-режиме,
+        хотя маржа для фьючерсов доступна.
+        """
         params = {}
-        headers = self._sign("balanceQuery", params)
+        headers = self._sign("collateralQuery", params)
         get_headers = {k: v for k, v in headers.items() if k != "Content-Type"}
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{self.BASE_URL}/api/v1/capital",
+                f"{self.BASE_URL}/api/v1/capital/collateral",
                 headers=get_headers,
             )
             if resp.status_code != 200:
-                raise RuntimeError(f"Backpack balance error: {resp.text}")
+                raise RuntimeError(f"Backpack collateral error: {resp.text}")
             data = resp.json()
-        # API возвращает словарь {"USDC": {"available": "...", "locked": "..."}, ...}
-        if isinstance(data, dict) and "USDC" in data:
-            return float(data["USDC"].get("available", 0) or 0)
+
+        if isinstance(data, dict):
+            # Предпочитаем futures-доступную маржу
+            nea = data.get("netEquityAvailable")
+            if nea is not None:
+                return float(nea or 0)
+
+            # Фолбэк на старый формат, если API изменится обратно
+            if "USDC" in data and isinstance(data["USDC"], dict):
+                return float(data["USDC"].get("available", 0) or 0)
+
         return 0.0
 
     async def get_positions(self) -> list:
