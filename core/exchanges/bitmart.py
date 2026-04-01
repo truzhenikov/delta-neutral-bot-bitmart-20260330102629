@@ -218,10 +218,12 @@ class BitMartExecutor:
             positions.append(pos)
         return positions
 
-    async def get_cumulative_funding_payment(self, symbol: str) -> float:
+    async def get_cumulative_funding_payment(self, symbol: str, since_ts: float | None = None) -> float:
         """
         Возвращает фактически накопленный funding payment по символу.
         BitMart отдаёт его через transaction-history с flow_type=3 (Funding Fee).
+
+        since_ts: unix timestamp (sec). Если задан, считаем только записи после открытия позиции.
         """
         data = await self._keyed_get(
             "/contract/private/transaction-history",
@@ -233,8 +235,13 @@ class BitMartExecutor:
             },
         )
         total = 0.0
+        since_ms = int(since_ts * 1000) if since_ts else None
         for item in data.get("data") or []:
             try:
+                if since_ms is not None:
+                    ts_ms = int(item.get("time") or 0)
+                    if ts_ms and ts_ms < since_ms:
+                        continue
                 total += float(item.get("amount") or 0)
             except (TypeError, ValueError):
                 continue

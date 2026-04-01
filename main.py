@@ -436,19 +436,10 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
     except Exception as e:
         logger.warning(f"_monitor_open_pairs: Backpack positions недоступны: {e}")
 
+    bitmart = None
     try:
         from core.executor import _get_bitmart
         bitmart = _get_bitmart()
-        open_symbols = {
-            p["legs"][0]["symbol"]
-            for p in pairs
-            if len(p.get("legs", [])) == 2 and {l["exchange"] for l in p["legs"]} == {"BitMart", "Backpack"}
-        }
-        for sym in open_symbols:
-            try:
-                bitmart_funding_real[sym] = await bitmart.get_cumulative_funding_payment(sym)
-            except Exception as e:
-                logger.warning(f"_monitor_open_pairs: BitMart funding недоступен для {sym}: {e}")
     except Exception as e:
         logger.warning(f"_monitor_open_pairs: BitMart funding API недоступен: {e}")
 
@@ -486,7 +477,14 @@ async def _monitor_open_pairs(lighter_rates: list, backpack_rates: list):
             if raw is not None:
                 bp_funding = float(raw)
 
-        lt_funding = bitmart_funding_real.get(symbol)
+        lt_funding = None
+        if bitmart and lt_leg:
+            try:
+                opened_at = float(lt_leg.get("opened_at") or 0)
+                lt_funding = await bitmart.get_cumulative_funding_payment(symbol, since_ts=opened_at if opened_at > 0 else None)
+            except Exception as e:
+                logger.warning(f"_monitor_open_pairs: BitMart funding недоступен для {symbol}: {e}")
+
         total_funding_usd = None if (bp_funding is None or lt_funding is None) else (bp_funding + lt_funding)
         net_funding_pct = _net_funding_pct(total_funding_usd, legs)
 
