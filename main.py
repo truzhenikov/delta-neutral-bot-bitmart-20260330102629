@@ -656,6 +656,10 @@ FUNDING_TAKE_PROFIT_PCT = 0.15  # накопленный чистый funding % 
 NEG_APR_HARD_CLOSE = -50.0  # APR пары ниже этого → АВТОЗАКРЫТИЕ немедленно
 NEG_APR_WAIT_HOURS = 4.0    # часов ожидания при мягком минусе перед автозакрытием
 
+BITMART_FEE_SITE_RATE = 0.0006   # 0.06% на сайте
+BITMART_FEE_DISCOUNT = 0.70      # скидка 70% от биржевого тарифа
+BACKPACK_FEE_SITE_RATE = 0.0004  # 0.04% на сайте
+
 
 def _net_funding_pct(total_funding_usd: float | None, legs: list[dict]) -> float | None:
     """Переводит накопленный funding в обычный % от размера одной ноги."""
@@ -675,6 +679,92 @@ def _estimated_leg_funding_usd(leg: dict | None, rate_obj, opened_ago_h: float) 
     return sign * rate_obj.rate * opened_ago_h * leg["position_size_usd"]
 
 
+async def _try_reopen_if_still_top(symbol: str):
+    """После автозакрытия: если пара всё ещё в топе возможностей, открываем заново."""
+    if not _signals_enabled.get("LT_BP", True):
+        return
+
+    try:
+        lt_rates, bp_rates = await asyncio.gather(
+            BitMartScanner().get_funding_rates(),
+            BackpackScanner().get_funding_rates(),
+        )
+    except Exception as e:
+        logger.warning(f"Автопереоткрытие {symbol}: не удалось получить ставки: {e}")
+        return
+
+    lt_map = {r.symbol: r for r in lt_rates}
+    bp_map = {r.symbol: r for r in bp_rates}
+
+    opps = []
+    for sym, lt in lt_map.items():
+        bp = bp_map.get(sym)
+        if not bp:
+            continue
+        if lt.apr == 0 and bp.apr == 0:
+            continue
+        if abs(lt.apr) > 2000 or abs(bp.apr) > 2000:
+            continue
+        if lt.volume_usd < MIN_VOLUME_USD or bp.volume_usd < MIN_VOLUME_USD:
+            continue
+
+        if lt.apr * bp.apr < 0:
+            net_apr = abs(lt.apr) + abs(bp.apr)
+            lt_dir = "SHORT" if lt.apr > 0 else "LONG"
+            bp_dir = "SHORT" if bp.apr > 0 else "LONG"
+        else:
+            net_apr = abs(abs(lt.apr) - abs(bp.apr))
+            if abs(lt.apr) >= abs(bp.apr):
+                lt_dir = "SHORT" if lt.apr > 0 else "LONG"
+                bp_dir = "LONG" if bp.apr > 0 else "SHORT"
+            else:
+                lt_dir = "LONG" if lt.apr > 0 else "SHORT"
+                bp_dir = "SHORT" if bp.apr > 0 else "LONG"
+
+        if net_apr < MIN_PAIR_APR:
+            continue
+
+        opps.append({
+            "symbol": sym,
+            "net_apr": net_apr,
+            "lt_dir": lt_dir,
+            "bp_dir": bp_dir,
+        })
+
+    if not opps:
+        return
+
+    opps.sort(key=lambda x: x["net_apr"], reverse=True)
+    top = opps[:TOP_OPPORTUNITIES_TO_SHOW]
+    current = next((o for o in top if o["symbol"] == symbol), None)
+    if not current:
+        return
+
+    size_usd = float(_position_sizes.get("LT_BP", POSITION_SIZE_USD))
+    try:
+        result = await open_pair(
+            symbol=symbol,
+            lighter_dir=current["lt_dir"],
+            backpack_dir=current["bp_dir"],
+            size_usd=size_usd,
+            entry_apr=current["net_apr"],
+        )
+        await send_message(
+            f"♻️ *Пара переоткрыта — {symbol}*\n\n"
+            f"После автозакрытия пара осталась в топ-возможностях.\n"
+            f"Направления: BitMart `{current['lt_dir']}` | Backpack `{current['bp_dir']}`\n"
+            f"Нетто APR: `~{current['net_apr']:.1f}%`\n"
+            f"Размер: `${size_usd:.0f}` на ногу\n\n"
+            f"Pair ID: `{result.get('pair_id', 'n/a')}`"
+        )
+    except Exception as e:
+        logger.warning(f"Автопереоткрытие {symbol} не удалось: {e}")
+        await send_message(
+            f"⚠️ *Автопереоткрытие не удалось — {symbol}*\n\n"
+            f"Ошибка: `{e}`"
+        )
+
+
 async def _auto_close_pair(pair_id: str, symbol: str, legs: list, reason: str):
     """Автоматически закрывает пару и уведомляет в Telegram."""
     try:
@@ -687,6 +777,9 @@ async def _auto_close_pair(pair_id: str, symbol: str, legs: list, reason: str):
             f"✅ Пара закрыта автоматически."
         )
         logger.info(f"Автозакрытие {pair_id} ({symbol}): успешно")
+
+        # По запросу: если после закрытия пара всё ещё в топе возможностей — открыть заново
+        await _try_reopen_if_still_top(symbol)
     except Exception as e:
         logger.error(f"Автозакрытие {pair_id} ({symbol}) провалилось: {e}")
         await send_message(
@@ -1400,19 +1493,23 @@ async def _build_history_page(page: int) -> tuple:
                 * duration_h * l["position_size_usd"]
                 for l in legs
             )
-            fees = sum(l.get("fees_usd") or 0 for l in legs)
-            if fees == 0:
-                fees = sum(
-                    l["position_size_usd"] * 0.0008
-                    for l in legs if l["exchange"] == "Backpack"
-                )
-            net = funding - fees
+
+            bitmart_legs = [l for l in legs if l.get("exchange") == "BitMart"]
+            backpack_legs = [l for l in legs if l.get("exchange") == "Backpack"]
+
+            bm_fee_raw = sum(float(l.get("position_size_usd") or 0) * BITMART_FEE_SITE_RATE * 2 for l in bitmart_legs)
+            bm_fee_effective = bm_fee_raw * (1 - BITMART_FEE_DISCOUNT)  # скидка 70% от биржевого тарифа
+            bp_fee = sum(float(l.get("position_size_usd") or 0) * BACKPACK_FEE_SITE_RATE * 2 for l in backpack_legs)
+
+            fees_total = bm_fee_effective + bp_fee
+            net = funding - fees_total
             page_total += net
             lines.append(
                 f"🔀 *{symbol}* — {exch_a} × {exch_b}\n"
                 f"  ⏱ Держали: `{duration_str}`\n"
                 f"  📈 Фандинг (~): `+${funding:.4f}`\n"
-                f"  💸 Комиссии Backpack: `-${fees:.4f}`\n"
+                f"  💸 Комиссии Backpack: `-${bp_fee:.4f}`\n"
+                f"  💸 Комиссии BitMart (со скидкой 70%): `-${bm_fee_effective:.4f}`\n"
                 f"  ✅ Итого (~): `${net:.4f}`\n"
             )
         else:
@@ -1965,6 +2062,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await close_pair(pair_id=pair_id, symbol=symbol, legs=legs)
             await query.edit_message_text(f"✅ Пара {symbol} закрыта")
+            await send_message(f"✅ *Пара {symbol} закрыта вручную*")
         except Exception as e:
             logger.error(f"Ошибка закрытия пары: {e}")
             # parse_mode=None — ошибка может содержать JSON с символами ломающими Markdown
