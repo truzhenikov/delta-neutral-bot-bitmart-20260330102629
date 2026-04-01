@@ -1204,6 +1204,13 @@ async def show_positions(update: Update):
         sym = pos.get("symbol", "").replace("_USDC_PERP", "").upper()
         bp_real_map[sym] = pos
 
+    bitmart_exec = None
+    try:
+        from core.executor import _get_bitmart
+        bitmart_exec = _get_bitmart()
+    except Exception as e:
+        logger.warning(f"show_positions: BitMart factual funding недоступен: {e}")
+
     for group in position_groups:
         legs = group["legs"]
         pair_id = group["pair_id"]
@@ -1346,9 +1353,21 @@ async def show_positions(update: Update):
                 if r:
                     bp_funding = _estimated_leg_funding_usd(bp_leg, r, opened_ago)
 
-            # ── BitMart: оценка заработка по текущему фандингу ────────────────────
+            # ── BitMart: factual funding c момента открытия ноги; fallback на оценку ──
             lt_funding = None
-            if lt_leg:
+            lt_is_real = False
+            if lt_leg and bitmart_exec:
+                try:
+                    opened_at = float(lt_leg.get("opened_at") or 0)
+                    lt_funding = await bitmart_exec.get_cumulative_funding_payment(
+                        lt_leg['symbol'],
+                        since_ts=opened_at if opened_at > 0 else None,
+                    )
+                    lt_is_real = True
+                except Exception as e:
+                    logger.warning(f"show_positions: BitMart factual funding недоступен для {symbol}: {e}")
+
+            if lt_funding is None and lt_leg:
                 key = f"BitMart:{lt_leg['symbol']}"
                 r = rates_map.get(key)
                 if r:
@@ -1385,16 +1404,18 @@ async def show_positions(update: Update):
             if bp_funding is not None and lt_funding is not None:
                 total_earned = bp_funding + lt_funding
                 bp_label = "факт." if bp_is_real else "~"
+                lt_label = "факт." if lt_is_real else "~прибл."
                 earned_str = (
                     f"`${total_earned:.4f}`" + (f" (`{net_funding_pct:.3f}%`)" if net_funding_pct is not None else "") + "\n"
                     f"  ├ Backpack: `${bp_funding:.4f}` ({bp_label})\n"
-                    f"  └ BitMart: `${lt_funding:.4f}` (~прибл.)"
+                    f"  └ BitMart: `${lt_funding:.4f}` ({lt_label})"
                 )
             elif bp_funding is not None:
                 bp_label = "факт." if bp_is_real else "~прибл."
                 earned_str = f"`${bp_funding:.4f}` ({bp_label})"
             elif lt_funding is not None:
-                earned_str = f"`${lt_funding:.4f}` (~прибл.)"
+                lt_label = "факт." if lt_is_real else "~прибл."
+                earned_str = f"`${lt_funding:.4f}` ({lt_label})"
             else:
                 earned_str = "_нет данных_"
 
