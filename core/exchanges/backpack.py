@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 import time
@@ -185,6 +186,47 @@ class BackpackExecutor:
 
         exit_price = float(result.get("avgPrice") or result.get("price") or 0)
         fees_paid = float(result.get("fee") or 0)
+
+        # Важный пост-чек: биржа может принять reduceOnly, но позиция может остаться (частично/полностью)
+        await asyncio.sleep(0.6)
+        positions_after = await self.get_positions()
+        pos_after = next((p for p in positions_after if p.get("symbol") == bp_symbol), None)
+        rem_qty = float((pos_after or {}).get("netQuantity") or (pos_after or {}).get("quantity") or 0)
+
+        if abs(rem_qty) > 1e-12:
+            # Один догоняющий reduceOnly на остаток
+            retry_params = {
+                "orderType": "Market",
+                "quantity": f"{abs(rem_qty):g}",
+                "reduceOnly": True,
+                "side": "Ask" if rem_qty > 0 else "Bid",
+                "symbol": bp_symbol,
+            }
+            retry_headers = self._sign("orderExecute", retry_params)
+            async with httpx.AsyncClient(timeout=10) as client:
+                retry_resp = await client.post(
+                    f"{self.BASE_URL}/api/v1/order",
+                    json=retry_params,
+                    headers=retry_headers,
+                )
+                retry_result = retry_resp.json()
+
+            if retry_resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Backpack reduceOnly retry failed for {symbol}: {retry_result}"
+                )
+
+            fees_paid += float(retry_result.get("fee") or 0)
+            await asyncio.sleep(0.6)
+            positions_after = await self.get_positions()
+            pos_after = next((p for p in positions_after if p.get("symbol") == bp_symbol), None)
+            rem_qty = float((pos_after or {}).get("netQuantity") or (pos_after or {}).get("quantity") or 0)
+
+        if abs(rem_qty) > 1e-10:
+            raise RuntimeError(
+                f"Backpack leg still open after close: {symbol}, remaining qty={rem_qty:g}"
+            )
+
         logger.info(f"Backpack: закрыта позиция {symbol}, qty={abs(qty)}, price={exit_price}")
         return {"symbol": symbol, "closed_qty": abs(qty), "price": exit_price, "fee": fees_paid}
 
